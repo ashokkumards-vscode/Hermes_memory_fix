@@ -1,0 +1,2102 @@
+diff --git a/agent/context_engine.py b/agent/context_engine.py
+--- a/agent/context_engine.py
++++ b/agent/context_engine.py
+@@ -219,6 +219,7 @@ def select_context(
+         conversation_messages: List[Dict[str, Any]] = None,
+         incoming_message: Dict[str, Any] = None,
+         budget_tokens: int = 0,
++        current_turn_user_idx: int = -2,
+     ) -> List[Dict[str, Any]]:
+         """Optionally choose/replace the context for THIS request, pre-generation.
+ 
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1479,6 +1479,7 @@ def _apply_context_engine_selection(
+     conversation_messages: List[Dict[str, Any]],
+     incoming_message: Optional[Dict[str, Any]],
+     *,
++    current_turn_user_idx: int = -2,
+     logger: Any,
+ ) -> List[Dict[str, Any]]:
+     """Run the optional per-turn ``ContextEngine.select_context()`` hook.
+@@ -1530,6 +1531,7 @@ def _apply_context_engine_selection(
+             conversation_messages=_conv_copy,
+             incoming_message=_incoming_copy,
+             budget_tokens=getattr(engine, "context_length", 0) or 0,
++            current_turn_user_idx=current_turn_user_idx,
+         )
+     except Exception:
+         logger.warning(
+@@ -2239,6 +2241,7 @@ def run_conversation(
+             api_messages,
+             messages,
+             _sel_incoming,
++            current_turn_user_idx=current_turn_user_idx,
+             logger=request_logger,
+         )
+ 
+diff --git a/plugins/context_engine/working-memory/.gitignore b/plugins/context_engine/working-memory/.gitignore
+new file mode 100644
+--- /dev/null
++++ b/plugins/context_engine/working-memory/.gitignore
+@@ -0,0 +1,9 @@
++# Backup files — local-only, not part of the plugin distribution
++*.bak
++*.bak-*
++*.pre-regex-fix
++*.pre-*
++
++# Python cache
++__pycache__/
++*.pyc
+diff --git a/plugins/context_engine/working-memory/__init__.py b/plugins/context_engine/working-memory/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/plugins/context_engine/working-memory/__init__.py
+@@ -0,0 +1,970 @@
++"""
++Working-Memory Context Engine — Phase 3: controlled real-context A/B test.
++
++Extends the built-in ContextCompressor with a ``select_context()`` override
++that, for Telegram sessions, can build a compact-context proposal.
++
++Modes:
++  shadow (default)  — select_context() returns None (Hermes sends full context)
++  active            — select_context() returns compact context for allowlisted
++                      sessions; all others return None
++
++Inherits ALL compression behavior (summarisation, pruning, cooldowns,
++telemetry) from ContextCompressor.  Rollback is a single config change:
++
++    # config.yaml
++    context.engine: compressor   (was: working-memory)
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import time
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++from agent.context_compressor import ContextCompressor
++from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens_rough
++
++logger = logging.getLogger(__name__)
++
++# ── Configuration constants ────────────────────────────────────────────────
++# ENABLED_PLATFORMS removed -- replaced by _ACTIVE_PLATFORMS / _EXCLUDED_PLATFORMS / _ACTIVE_SESSIONS
++RECENT_MESSAGES = 20
++RECENT_RAW_TOKEN_TARGET = 30000
++WORKING_MEMORY_BASE = Path.home() / ".hermes" / "context-working-memory"
++STATE_DIR = WORKING_MEMORY_BASE
++CONFIG_FILE = WORKING_MEMORY_BASE / "phase3_config.yaml"
++STABLE_FILE = "stable.md"
++STATE_FILE = "state.md"
++SHADOW_LOG = "shadow.jsonl"
++MAX_VERSIONS = 10
++
++# Default config values (overridden by phase3_config.yaml)
++_MODE = "shadow"
++_MIN_SAVINGS_PCT = 25
++_MAX_COMPACT_TOKENS = 100000
++_ACTIVE_SESSIONS: List[str] = []
++_ACTIVE_PLATFORMS: set = set()
++_EXCLUDED_PLATFORMS: set = set()
++_EXCLUDED_SESSIONS: set = set()
++_MIN_ORIGINAL_TOKENS = 50000
++_CONFIG_LOADED = False
++
++
++def _load_config(*, force: bool = False) -> None:
++    """Load Phase 3 configuration from YAML file (idempotent unless force=True)."""
++    global _MODE, _MIN_SAVINGS_PCT, _MAX_COMPACT_TOKENS, _ACTIVE_SESSIONS, _CONFIG_LOADED
++    global _ACTIVE_PLATFORMS, _EXCLUDED_PLATFORMS, _EXCLUDED_SESSIONS, _MIN_ORIGINAL_TOKENS
++    if _CONFIG_LOADED and not force:
++        return
++    _CONFIG_LOADED = True
++    try:
++        import yaml
++        if CONFIG_FILE.exists():
++            with open(CONFIG_FILE, "r") as f:
++                cfg = yaml.safe_load(f) or {}
++            _MODE = str(cfg.get("mode", "shadow")).strip().lower()
++            _MIN_SAVINGS_PCT = int(cfg.get("min_savings_pct", 25))
++            _MAX_COMPACT_TOKENS = int(cfg.get("max_compact_tokens", 100000))
++            _MIN_ORIGINAL_TOKENS = int(cfg.get("min_original_tokens", 50000))
++            _ACTIVE_SESSIONS = list(cfg.get("active_sessions", []))
++            _ACTIVE_PLATFORMS = set(cfg.get("active_platforms", []))
++            _EXCLUDED_PLATFORMS = set(cfg.get("excluded_platforms", []))
++            _EXCLUDED_SESSIONS = set(cfg.get("excluded_sessions", []))
++            logger.info(
++                "Working-memory: mode=%s, active_platforms=%s, active_sessions=%d, excluded_platforms=%s, excluded_sessions=%d",
++                _MODE, sorted(_ACTIVE_PLATFORMS), len(_ACTIVE_SESSIONS),
++                sorted(_EXCLUDED_PLATFORMS), len(_EXCLUDED_SESSIONS),
++            )
++    except Exception as exc:
++        logger.debug("Failed to load phase3 config: %s", exc)
++
++
++# ── register() for Hermes plugin discovery ─────────────────────────────────
++def register(ctx):
++    """Hermes context-engine plugin registration entrypoint."""
++    _load_config()
++    engine = WorkingMemoryCompressor()
++    ctx.register_context_engine(engine)
++
++
++# ── The engine ─────────────────────────────────────────────────────────────
++class WorkingMemoryCompressor(ContextCompressor):
++    """Context engine with working-memory state and compact context selection.
++
++    Preserves every inherited compression behaviour.  ``select_context()``
++    and lifecycle hooks are overridden to add compact-context selection
++    (shadow or active depending on config) and state extraction.
++    """
++
++    def __init__(self):
++        _load_config()
++        super().__init__(
++            model="",
++            threshold_percent=0.75,
++            protect_first_n=3,
++            protect_last_n=20,
++            summary_target_ratio=0.20,
++        )
++        # Working-memory state (all set during on_session_start)
++        self._session_platform: str = ""
++        self._session_id: str = ""
++        self._session_dir: Optional[Path] = None
++        self._shadow_log_path: Optional[Path] = None
++        self._stable_path: Optional[Path] = None
++        self._state_path: Optional[Path] = None
++        self._shadow_turn: int = 0
++        # State version tracking
++        self._state_version: int = 0
++        # Shadow metrics for state extraction
++        self._last_state_significance: str = ""
++        self._last_state_attempted: bool = False
++        self._last_state_applied: bool = False
++        self._last_state_skip_reason: str = ""
++        self._last_state_error: str = ""
++        self._last_state_patch_counts: str = ""
++
++    # ── Identity ───────────────────────────────────────────────────────────
++
++    @property
++    def name(self) -> str:
++        return "working-memory"
++
++    # ── Lifecycle hooks (all call super()) ─────────────────────────────────
++
++    def on_session_start(self, session_id: str, **kwargs) -> None:
++        """Attach to a new or resumed session."""
++        super().on_session_start(session_id, **kwargs)
++        self._session_id = session_id
++        self._session_platform = kwargs.get("platform", "") or ""
++        self._shadow_turn = 0
++        self._state_version = 0
++
++        if self._is_shadow_eligible():
++            self._ensure_session_dir()
++        else:
++            self._session_dir = None
++            self._shadow_log_path = None
++
++    def on_session_reset(self) -> None:
++        """Reset per-session state."""
++        super().on_session_reset()
++        self._session_platform = ""
++        self._session_id = ""
++        self._session_dir = None
++        self._shadow_log_path = None
++        self._stable_path = None
++        self._state_path = None
++        self._shadow_turn = 0
++        self._state_version = 0
++
++    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
++        """Tear-down at real session boundaries."""
++        super().on_session_end(session_id, messages)
++        self._session_id = ""
++        self._shadow_turn = 0
++
++    # ── on_turn_complete — state extraction (unchanged from Phase 2.1) ────
++
++    def on_turn_complete(
++        self,
++        messages: List[Dict[str, Any]],
++        usage: Dict[str, Any] = None,
++        **kwargs: Any,
++    ) -> None:
++        """Post-turn observation: update working-memory state if meaningful."""
++        self._last_state_significance = ""
++        self._last_state_attempted = False
++        self._last_state_applied = False
++        self._last_state_skip_reason = ""
++        self._last_state_error = ""
++        self._last_state_patch_counts = ""
++
++        if not self._is_shadow_eligible():
++            self._last_state_skip_reason = "not_eligible"
++            return
++
++        interrupted = kwargs.get("interrupted", False)
++        failed = kwargs.get("failed", False)
++
++        # Import state extractor lazily
++        is_significant_turn = None
++        extract_state_patch = None
++        apply_state_patch = None
++        write_state_files = None
++        load_state_files = None
++        set_updating_flag = None
++        clear_updating_flag = None
++        try:
++            import importlib.util
++            _engine_dir = Path(__file__).parent
++            _extractor_path = _engine_dir / "state_extractor.py"
++            if _extractor_path.exists():
++                _spec = importlib.util.spec_from_file_location(
++                    "working_memory_extractor", str(_extractor_path),
++                )
++                _mod = importlib.util.module_from_spec(_spec)
++                _spec.loader.exec_module(_mod)
++                is_significant_turn = _mod.is_significant_turn
++                extract_state_patch = _mod.extract_state_patch
++                apply_state_patch = _mod.apply_state_patch
++                write_state_files = _mod.write_state_files
++                load_state_files = _mod.load_state_files
++                set_updating_flag = _mod.set_updating_flag
++                clear_updating_flag = _mod.clear_updating_flag
++                load_id_counters = _mod.load_id_counters
++        except Exception as exc:
++            logger.debug("State extractor not available: %s", exc)
++            return
++
++        if None in (is_significant_turn, extract_state_patch, apply_state_patch,
++                    write_state_files, load_state_files, set_updating_flag,
++                    clear_updating_flag):
++            return
++
++        if set_updating_flag(self):
++            self._last_state_skip_reason = "recursion_guard"
++            return
++
++        try:
++            significant, reason = is_significant_turn(
++                messages, interrupted=interrupted, failed=failed,
++            )
++            self._last_state_significance = reason
++            if not significant:
++                self._last_state_skip_reason = reason
++                return
++
++            self._last_state_attempted = True
++            stable_text, state_text = "", ""
++            if self._session_dir is not None:
++                stable_text, state_text = load_state_files(self._session_dir)
++
++            patch = extract_state_patch(
++                self, messages, stable_text, state_text, self._session_id,
++            )
++            if patch is None:
++                self._last_state_error = "extraction_failed"
++                return
++
++            sig = patch.get("significance", "none")
++            if sig == "none":
++                self._last_state_skip_reason = "llm_significance_none"
++                return
++
++            counts = {}
++            for key in (
++                "stable_add", "stable_resolve", "architecture_add", "architecture_resolve",
++                "paths_add", "paths_resolve", "constraints_add", "constraints_resolve",
++                "confirmed_working_add", "confirmed_working_resolve",
++                "blockers_add", "blockers_resolve",
++                "decisions_add", "decisions_resolve",
++                "provisional_decisions_add", "provisional_decisions_resolve",
++                "questions_add", "questions_resolve",
++                "next_actions_add", "next_actions_remove", "recent_changes_add",
++                "current_objective",
++            ):
++                val = patch.get(key, [])
++                if isinstance(val, list) and val:
++                    counts[key] = len(val)
++            self._last_state_patch_counts = json.dumps(counts, sort_keys=True)
++
++            _idc = load_id_counters(self._session_dir) if self._session_dir is not None else None
++            new_stable, new_state = apply_state_patch(
++                patch, stable_text, state_text,
++                id_counters=_idc, session_dir=self._session_dir,
++            )
++            if self._session_dir is not None:
++                ok = write_state_files(
++                    self._session_dir, new_stable, new_state,
++                    max_versions=MAX_VERSIONS, session_id=self._session_id,
++                )
++                if ok:
++                    self._state_version += 1
++                    self._last_state_applied = True
++                else:
++                    self._last_state_error = "file_write_failed"
++        except Exception as exc:
++            logger.warning("State update failed (session=%s): %s", self._session_id, exc)
++            self._last_state_error = str(exc)[:200]
++        finally:
++            clear_updating_flag(self)
++
++    # ── bootstrap_session_state — one-time population of state.md ────────
++
++    def bootstrap_session_state(self) -> bool:
++        """Bootstrap operational state for the current session.
++
++        Reads the full conversation history from Hermes SessionDB, derives
++        operational state via the LLM, and populates state.md only.
++
++        Returns True if state was populated, False otherwise.
++        Callable explicitly — does NOT run automatically.
++        """
++        if not self._session_dir:
++            logger.warning("Bootstrap: no session directory for %s", self._session_id)
++            return False
++
++        try:
++            # Import dependencies
++            from hermes_state import SessionDB
++            from hermes_constants import get_hermes_home
++            import importlib as _il
++            _ed = Path(__file__).parent
++            _ep = _ed / "state_extractor.py"
++            _es = _il.util.spec_from_file_location("_wm_bootstrap_extractor", str(_ep))
++            _em = _il.util.module_from_spec(_es)
++            _es.loader.exec_module(_em)
++            _bootstrap = _em.bootstrap_session_state
++            load_state_files = _em.load_state_files
++            migrate_existing_entries = _em.migrate_existing_entries
++
++            # Open SessionDB read-only
++            db_path = get_hermes_home() / "state.db"
++            if not db_path.exists():
++                logger.warning("Bootstrap: state.db not found at %s", db_path)
++                return False
++
++            db = SessionDB(db_path=db_path, read_only=True)
++            try:
++                messages = db.get_messages_as_conversation(
++                    self._session_id,
++                    include_ancestors=True,
++                    repair_alternation=False,
++                )
++            finally:
++                try:
++                    db.close()
++                except Exception:
++                    pass
++
++            if not messages:
++                logger.warning("Bootstrap: no messages found for session %s", self._session_id)
++                return False
++
++            # Run migration on existing entries (idempotent)
++            migrate_existing_entries(self._session_dir)
++
++            # Load current state
++            stable_text, state_text = load_state_files(self._session_dir)
++
++            # Run bootstrap
++            result = _bootstrap(
++                session_id=self._session_id,
++                session_dir=self._session_dir,
++                messages=messages,
++                stable_text=stable_text,
++                state_text=state_text,
++            )
++
++            return result
++
++        except Exception as exc:
++            logger.warning("Bootstrap failed (session=%s): %s", self._session_id, exc)
++            return False
++
++    # ── select_context — Phase 3: shadow or active ─────────────────────────
++
++    def select_context(
++        self,
++        request_messages: List[Dict[str, Any]],
++        *,
++        conversation_messages: List[Dict[str, Any]] = None,
++        incoming_message: Dict[str, Any] = None,
++        budget_tokens: int = 0,
++        current_turn_user_idx: int = -2,
++    ) -> Optional[List[Dict[str, Any]]]:
++        """Select compact context: shadow mode returns None, active returns compact.
++
++        Shadow mode: builds proposed context, logs metrics, returns None.
++        Active mode: validates and returns compact context for allowlisted sessions.
++
++        Always fails open (returns None) on any error, invalid session, or
++        failed validation.
++        """
++        # Fast path: skip non-telegram sessions
++        if not self._is_shadow_eligible():
++            return None
++        if not request_messages:
++            return None
++
++        self._shadow_turn += 1
++        original_estimate = estimate_messages_tokens_rough(request_messages)
++        original_count = len(request_messages)
++
++        # ── Build proposed compact context ────────────────────────────────
++        system_msgs, prefill_msgs, conv_msgs = _split_request_messages(request_messages)
++        proposed_tail = _take_complete_tail(conv_msgs, RECENT_MESSAGES)
++        tool_extensions = len(proposed_tail) - min(len(conv_msgs), RECENT_MESSAGES)
++        if tool_extensions < 0:
++            tool_extensions = 0
++
++        # Load working-memory files
++        stable_text, state_text = "", ""
++        if self._session_dir is not None:
++            stable_text = _safe_read(self._session_dir / STABLE_FILE)
++            state_text = _safe_read(self._session_dir / STATE_FILE)
++
++        # Assemble proposed message list
++        proposed_msgs: List[Dict[str, Any]] = []
++        proposed_msgs.extend(system_msgs)
++        proposed_msgs.extend(prefill_msgs)
++
++        # Inject working memory as user-role context blocks (NOT system).
++        # This prevents them from being treated as system instructions.
++        if stable_text.strip():
++            proposed_msgs.append({
++                "role": "user",
++                "content": _WORKING_MEMORY_PREAMBLE.format(
++                    label="DURABLE (stable.md)",
++                    content=stable_text.strip(),
++                ),
++            })
++        if state_text.strip():
++            proposed_msgs.append({
++                "role": "user",
++                "content": _WORKING_MEMORY_PREAMBLE.format(
++                    label="CURRENT STATE (state.md)",
++                    content=state_text.strip(),
++                ),
++            })
++
++        proposed_msgs.extend(proposed_tail)
++        proposed_estimate = estimate_messages_tokens_rough(proposed_msgs)
++        proposed_count = len(proposed_msgs)
++
++        # Breakdown tokens
++        system_tokens = estimate_messages_tokens_rough(system_msgs) if system_msgs else 0
++        stable_state_tokens = estimate_tokens_rough(stable_text.strip()) if stable_text.strip() else 0
++        rolling_state_tokens = estimate_tokens_rough(state_text.strip()) if state_text.strip() else 0
++        recent_raw_tokens = estimate_messages_tokens_rough(proposed_tail) if proposed_tail else 0
++
++        reduction_pct = 0.0
++        if original_estimate > 0:
++            reduction_pct = round((original_estimate - proposed_estimate) / original_estimate * 100, 1)
++
++        # ── Determine if we should select (active mode) or shadow ─────────
++        mode = _MODE
++        is_allowlisted = self._session_id in _ACTIVE_SESSIONS
++        # Selection policy: excluded -> denied, active_sessions -> allow, active_platforms -> allow
++        if mode != "active":
++            should_select = False
++        elif self._session_id in _EXCLUDED_SESSIONS:
++            should_select = False
++        elif self._session_platform.lower() in _EXCLUDED_PLATFORMS:
++            should_select = False
++        elif self._session_id in _ACTIVE_SESSIONS:
++            should_select = True
++        elif self._session_platform.lower() in _ACTIVE_PLATFORMS:
++            should_select = True
++        else:
++            should_select = False
++        selection_attempted = should_select
++        selection_applied = False
++        selection_fallback_reason = ""
++        validation_results: Dict[str, Any] = {}
++
++        if should_select:
++            # Skip if original context is already small (no benefit from compaction)
++            if original_estimate < _MIN_ORIGINAL_TOKENS:
++                selection_fallback_reason = f"original_too_small_{original_estimate}tokens"
++            else:
++                # Run safety validations
++                selection_applied, validation_results = _validate_compact_context(
++                    request_messages=request_messages,
++                    proposed_msgs=proposed_msgs,
++                    system_msgs=system_msgs,
++                    proposed_tail=proposed_tail,
++                    stable_text=stable_text,
++                    state_text=state_text,
++                    original_estimate=original_estimate,
++                    proposed_estimate=proposed_estimate,
++                    reduction_pct=reduction_pct,
++                    incoming_message=incoming_message,
++                    current_turn_user_idx=current_turn_user_idx,
++                )
++
++            if not selection_applied:
++                if not selection_fallback_reason:
++                    selection_fallback_reason = validation_results.get(
++                        "fallback_reason", "validation_failed"
++                    )
++
++        # ── Write log record ──────────────────────────────────────────────
++        record = {
++            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
++            "session_id": self._session_id,
++            "platform": self._session_platform,
++            "mode": mode,
++            "model": getattr(self, "model", ""),
++            "provider": getattr(self, "provider", ""),
++            "turn": self._shadow_turn,
++            "current_turn_user_idx": current_turn_user_idx,
++            "original_message_count": original_count,
++            "selected_message_count": proposed_count,
++            "original_estimated_tokens": original_estimate,
++            "selected_estimated_tokens": proposed_estimate,
++            "reduction_pct": reduction_pct,
++            "system_tokens": system_tokens,
++            "stable_state_tokens": stable_state_tokens,
++            "rolling_state_tokens": rolling_state_tokens,
++            "recent_raw_tokens": recent_raw_tokens,
++            "tool_pair_extension_count": tool_extensions,
++            "selection_attempted": selection_attempted,
++            "selection_applied": selection_applied,
++            "selection_fallback_reason": selection_fallback_reason,
++            "validation_results": json.dumps(validation_results, sort_keys=True) if validation_results else "",
++            "state_significance_detected": self._last_state_significance,
++            "state_update_attempted": self._last_state_attempted,
++            "state_update_applied": self._last_state_applied,
++            "state_update_skipped_reason": self._last_state_skip_reason,
++            "state_update_error": self._last_state_error,
++            "state_patch_counts": self._last_state_patch_counts,
++            "state_version": self._state_version,
++        }
++        self._append_shadow_record(record)
++
++        if selection_applied:
++            logger.info(
++                "Compact context SELECTED (session=%s, turn=%d, %s -> %s, %.1f%% reduction)",
++                self._session_id, self._shadow_turn, original_estimate, proposed_estimate, reduction_pct,
++            )
++            return proposed_msgs
++
++        return None
++
++    # ── Internal helpers ──────────────────────────────────────────────────
++
++    def _is_shadow_eligible(self) -> bool:
++        """Check whether the engine should track this session.
++
++        Selection hierarchy:
++          1. Excluded platform/session -> deny
++          2. Active session -> allow
++          3. Active platform -> allow
++          4. Otherwise -> deny
++        """
++        platform = self._session_platform.lower()
++        if platform in _EXCLUDED_PLATFORMS:
++            return False
++        if self._session_id in _EXCLUDED_SESSIONS:
++            return False
++        if self._session_id in _ACTIVE_SESSIONS:
++            return True
++        if platform in _ACTIVE_PLATFORMS:
++            return True
++        return False
++
++    def _ensure_session_dir(self) -> None:
++        """Create the per-session working-memory directory if it doesn't exist."""
++        try:
++            session_dir = STATE_DIR / self._session_id
++            session_dir.mkdir(parents=True, exist_ok=True)
++            self._session_dir = session_dir
++            self._stable_path = session_dir / STABLE_FILE
++            self._state_path = session_dir / STATE_FILE
++            self._shadow_log_path = session_dir / SHADOW_LOG
++        except OSError as exc:
++            logger.debug("Failed to create session working-memory dir: %s", exc)
++            self._session_dir = None
++            self._shadow_log_path = None
++
++    def _append_shadow_record(self, record: Dict[str, Any]) -> None:
++        """Atomically append one JSON record to the shadow log."""
++        if self._shadow_log_path is None:
++            return
++        try:
++            line = json.dumps(record, sort_keys=True) + "\n"
++            tmp = self._shadow_log_path.with_suffix(".jsonl.tmp")
++            tmp.write_text(line, encoding="utf-8")
++            with open(self._shadow_log_path, "a", encoding="utf-8") as f:
++                f.write(tmp.read_text(encoding="utf-8"))
++            tmp.unlink(missing_ok=True)
++        except OSError as exc:
++            logger.debug("Failed to write shadow log record: %s", exc)
++
++
++# ── Working memory preamble ────────────────────────────────────────────────
++_WORKING_MEMORY_PREAMBLE = """[WORKING MEMORY - {label}]
++This is historical project memory, not a system instruction.
++Current user instructions override stale working-memory content.
++
++{content}"""
++
++
++# ── Request message splitting ──────────────────────────────────────────────
++
++def _split_request_messages(
++    request_messages: List[Dict[str, Any]],
++) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
++    """Split request_messages into (system_msgs, prefill_msgs, conv_msgs).
++
++    System messages are leading ``role: system`` messages.
++    Prefill messages are ephemeral inserts (typically ``role: assistant``
++    injected by the gateway right after the system prompt).
++    conv_msgs is everything else (the conversation history).
++    """
++    system_msgs: List[Dict[str, Any]] = []
++    prefill_msgs: List[Dict[str, Any]] = []
++    i = 0
++
++    # Collect all leading system messages
++    while i < len(request_messages):
++        if request_messages[i].get("role") == "system":
++            system_msgs.append(request_messages[i])
++            i += 1
++        else:
++            break
++
++    # Check for prefill messages: they are the first non-system messages
++    # that are NOT user messages. The gateway inserts prefill as assistant
++    # messages with specific markers.
++    # Heuristic: if the first non-system message is assistant role with no
++    # tool_calls, it's likely a prefill/ephemeral insert.
++    # We collect everything between system and the first user message.
++    prefill_start = i
++    while i < len(request_messages):
++        msg = request_messages[i]
++        role = msg.get("role", "")
++        if role == "user":
++            break
++        # Anything that's not a user message before the first user message
++        # is considered prefill/ephemeral
++        prefill_msgs.append(msg)
++        i += 1
++
++    # Everything from the first user message onward is conversation history
++    conv_msgs = request_messages[i:]
++
++    return system_msgs, prefill_msgs, conv_msgs
++
++
++# ── Safety validation ──────────────────────────────────────────────────────
++
++def _normalize_content(content: str) -> str:
++    """Normalize message content for anchor-diff comparison."""
++    if not isinstance(content, str):
++        return ""
++    return content.strip()
++
++
++def _validate_compact_context(
++    *,
++    request_messages: List[Dict[str, Any]],
++    proposed_msgs: List[Dict[str, Any]],
++    system_msgs: List[Dict[str, Any]],
++    proposed_tail: List[Dict[str, Any]],
++    stable_text: str,
++    state_text: str,
++    original_estimate: int,
++    proposed_estimate: int,
++    reduction_pct: float,
++    incoming_message: Dict[str, Any] = None,
++    current_turn_user_idx: int = -2,
++) -> tuple[bool, Dict[str, Any]]:
++    """Run safety checks on the proposed compact context.
++
++    Returns (passed, details) where ``passed`` is True if all checks pass.
++    ``details`` contains per-check results and the fallback reason.
++    """
++    results: Dict[str, Any] = {}
++    all_ok = True
++
++    # 1. System messages preserved
++    orig_system_count = sum(1 for m in request_messages if m.get("role") == "system")
++    prop_system_count = sum(1 for m in proposed_msgs if m.get("role") == "system")
++    if orig_system_count > 0 and prop_system_count == 0:
++        results["system_preserved"] = False
++        results["fallback_reason"] = "system_messages_dropped"
++        all_ok = False
++    else:
++        results["system_preserved"] = True
++
++    # 2. System messages unchanged
++    if orig_system_count > 0 and prop_system_count > 0:
++        # Compare first system message content (they should be identical)
++        orig_sys = request_messages[0].get("content", "")
++        prop_sys = proposed_msgs[0].get("content", "") if proposed_msgs else ""
++        if orig_sys != prop_sys:
++            results["system_unchanged"] = False
++            if all_ok:
++                results["fallback_reason"] = "system_message_modified"
++                all_ok = False
++        else:
++            results["system_unchanged"] = True
++    else:
++        results["system_unchanged"] = True
++
++    # 3. Proposed context is smaller than original (sanity check)
++    if proposed_estimate >= original_estimate:
++        results["smaller_than_original"] = False
++        if all_ok:
++            results["fallback_reason"] = "proposed_not_smaller"
++            all_ok = False
++    else:
++        results["smaller_than_original"] = True
++
++    # 4. Minimum savings threshold
++    if reduction_pct < _MIN_SAVINGS_PCT:
++        results["min_savings_met"] = False
++        results["reduction_pct"] = reduction_pct
++        if all_ok:
++            results["fallback_reason"] = f"insufficient_savings_{reduction_pct}pct"
++            all_ok = False
++    else:
++        results["min_savings_met"] = True
++
++    # 5. Maximum size guard
++    if proposed_estimate > _MAX_COMPACT_TOKENS:
++        results["max_size_ok"] = False
++        if all_ok:
++            results["fallback_reason"] = f"oversized_{proposed_estimate}tokens"
++            all_ok = False
++    else:
++        results["max_size_ok"] = True
++
++    # 6. Recent conversation tail exists
++    if not proposed_tail:
++        results["tail_exists"] = False
++        if all_ok:
++            results["fallback_reason"] = "empty_tail"
++            all_ok = False
++    else:
++        results["tail_exists"] = True
++
++    # 7. No orphan tool results in proposed messages
++    tool_call_ids = set()
++    result_ids = set()
++    for msg in proposed_msgs:
++        if msg.get("role") == "assistant":
++            calls = msg.get("tool_calls", [])
++            if isinstance(calls, list):
++                for c in calls:
++                    if isinstance(c, dict) and c.get("id"):
++                        tool_call_ids.add(c["id"])
++        if msg.get("role") == "tool":
++            tid = msg.get("tool_call_id", "")
++            if tid:
++                result_ids.add(tid)
++    orphan_results = result_ids - tool_call_ids
++    if orphan_results:
++        results["orphan_tool_results"] = list(orphan_results)
++        if all_ok:
++            results["fallback_reason"] = "orphan_tool_results"
++            all_ok = False
++    else:
++        results["orphan_tool_results"] = False
++
++    # 8. No orphan tool calls (tool_calls without matching results)
++    orphan_calls = tool_call_ids - result_ids
++    if orphan_calls:
++        results["orphan_tool_calls"] = list(orphan_calls)
++        if all_ok:
++            results["fallback_reason"] = "orphan_tool_calls"
++            all_ok = False
++    else:
++        results["orphan_tool_calls"] = False
++
++    # 9. Current user message is anchored (ground truth from canonical index)
++    # Use current_turn_user_idx as the definitive anchor rather than scanning
++    # proposed_msgs for any user-role message. During long tool continuations,
++    # there may be no user message in conv_msgs, but the engine should still
++    # select context if a legitimate turn index exists.
++    user_anchored = False
++    anchor_source = "none"
++
++    if current_turn_user_idx >= 0:
++        # Canonical anchor explicitly provided by Hermes core.
++        user_anchored = True
++        anchor_source = "canonical"
++
++    elif current_turn_user_idx == -1:
++        # Hermes explicitly determined that there is no user-originated
++        # current turn. Do not guess from pseudo-user / working-memory rows.
++        user_anchored = False
++        anchor_source = "none"
++
++    elif current_turn_user_idx == -2:
++        # Compatibility path for callers that do not provide the canonical
++        # turn anchor yet.
++        if incoming_message is not None:
++            user_anchored = True
++            anchor_source = "incoming_message"
++        else:
++            user_msgs = [m for m in proposed_msgs if m.get("role") == "user"]
++            user_anchored = bool(user_msgs)
++            anchor_source = "legacy_scan" if user_anchored else "none"
++
++    else:
++        # Any other negative value is invalid; fail open.
++        user_anchored = False
++        anchor_source = "invalid"
++
++    results["user_anchor_source"] = anchor_source
++
++    if not user_anchored:
++        results["user_message_anchored"] = False
++        if all_ok:
++            results["fallback_reason"] = "no_user_anchor"
++            all_ok = False
++    else:
++        results["user_message_anchored"] = True
++
++    # 9b. Anchor message diff check: verify the anchor message content
++    # is actually present in the proposed compact context. This catches
++    # cases where the anchor exists (by index) but was dropped from the
++    # proposed context during construction (e.g., long tool chains pushed
++    # it out of the recent tail window).
++    #
++    # The check is a content-equality search: we find the anchor message
++    # by its canonical index in request_messages, then search for it in
++    # proposed_msgs. This is strictly more precise than the old "any
++    # role=user" scan because it targets the single message Hermes Core
++    # identified as the current turn.
++    anchor_in_proposed = True
++    anchor_diff_details = {}
++
++    if current_turn_user_idx >= 0:
++        anchor_msg = request_messages[current_turn_user_idx]
++        anchor_content = _normalize_content(anchor_msg.get("content", ""))
++        anchor_role = anchor_msg.get("role", "user")
++
++        if anchor_content:
++            found = any(
++                _normalize_content(m.get("content", "")) == anchor_content
++                and m.get("role") == anchor_role
++                for m in proposed_msgs
++            )
++            if not found:
++                anchor_in_proposed = False
++                anchor_diff_details = {
++                    "anchor_role": anchor_role,
++                    "anchor_content_len": len(anchor_content),
++                    "anchor_content_preview": anchor_content[:120],
++                }
++        # else: empty anchor content — can't meaningfully diff; pass
++
++    elif current_turn_user_idx == -2 and incoming_message is not None:
++        # Legacy path: check incoming_message content in proposed_msgs
++        incoming_content = _normalize_content(incoming_message.get("content", ""))
++        if incoming_content:
++            found = any(
++                _normalize_content(m.get("content", "")) == incoming_content
++                for m in proposed_msgs
++            )
++            if not found:
++                anchor_in_proposed = False
++                anchor_diff_details = {
++                    "anchor_role": "user",
++                    "anchor_content_len": len(incoming_content),
++                    "anchor_content_preview": incoming_content[:120],
++                    "source": "incoming_message",
++                }
++
++    # current_turn_user_idx == -1: no user anchor expected — pass
++
++    if not anchor_in_proposed:
++        results["anchor_in_proposed"] = False
++        results["anchor_diff_details"] = anchor_diff_details
++        if all_ok:
++            results["fallback_reason"] = "anchor_message_missing"
++            all_ok = False
++    else:
++        results["anchor_in_proposed"] = True
++
++    # 10. Stable/state memory loaded or absence is safe
++    # (No failure — it's acceptable to have no memory files)
++
++    if not all_ok and "fallback_reason" not in results:
++        results["fallback_reason"] = "multiple_validation_failures"
++
++    return all_ok, results
++
++
++# ── File helpers ───────────────────────────────────────────────────────────
++
++def _safe_read(path: Path) -> str:
++    """Read a file, returning empty string on failure."""
++    try:
++        if path.exists():
++            return path.read_text(encoding="utf-8", errors="replace")
++    except OSError:
++        pass
++    return ""
++
++
++# ── Tail helper (unchanged from Phase 2) ───────────────────────────────────
++
++def _take_complete_tail(
++    messages: List[Dict[str, Any]],
++    n: int,
++) -> List[Dict[str, Any]]:
++    """Return the last *n* messages, extending backward to keep tool pairs intact."""
++    if not messages or n <= 0:
++        return []
++
++    n = min(n, len(messages))
++    slice_start = len(messages) - n
++    tail = messages[slice_start:]
++    extended = False
++
++    # Phase 1: extend backward if first message in slice is a tool result
++    if tail and tail[0].get("role") == "tool":
++        tool_call_id = tail[0].get("tool_call_id", "")
++        if tool_call_id and slice_start > 0:
++            for j in range(slice_start - 1, -1, -1):
++                msg = messages[j]
++                if msg.get("role") == "assistant":
++                    calls = msg.get("tool_calls", [])
++                    if isinstance(calls, list) and any(
++                        isinstance(c, dict) and c.get("id") == tool_call_id
++                        for c in calls
++                    ):
++                        tail = messages[j:]
++                        extended = True
++                        break
++
++    # Phase 2: look for assistant messages with tool_calls whose results
++    # are missing; extend forward to include them.
++    assistant_tool_call_ids = set()
++    for msg in tail:
++        if msg.get("role") == "assistant":
++            calls = msg.get("tool_calls", [])
++            if isinstance(calls, list):
++                for c in calls:
++                    if isinstance(c, dict) and c.get("id"):
++                        assistant_tool_call_ids.add(c["id"])
++
++    result_ids = set()
++    for msg in tail:
++        if msg.get("role") == "tool":
++            tid = msg.get("tool_call_id", "")
++            if tid:
++                result_ids.add(tid)
++
++    missing = assistant_tool_call_ids - result_ids
++    if missing and extended is False:
++        tail = messages[slice_start:]
++
++    return tail
++
++
++# ── Public query helper ─────────────────────────────────────────────────────
++
++def is_session_eligible(session_id: str, platform: str) -> bool:
++    """Public query: is this session_id eligible for compact context (active or active-platform)?
++    Safe to call from outside the plugin (e.g. CLI) without instantiating WorkingMemoryEngine."""
++    _load_config()  # ensure config is loaded (no-op if already loaded)
++    platform = platform.lower()
++    if platform in _EXCLUDED_PLATFORMS:
++        return False
++    if session_id in _EXCLUDED_SESSIONS:
++        return False
++    if session_id in _ACTIVE_SESSIONS:
++        return True
++    if platform in _ACTIVE_PLATFORMS:
++        return True
++    return False
+diff --git a/plugins/context_engine/working-memory/plugin.yaml b/plugins/context_engine/working-memory/plugin.yaml
+new file mode 100644
+--- /dev/null
++++ b/plugins/context_engine/working-memory/plugin.yaml
+@@ -0,0 +1,4 @@
++name: working-memory
++description: "Shadow-mode context optimization engine — subclass of ContextCompressor that builds compact context proposals for monitoring without replacing the live message list."
++version: 0.1.0
++author: Ashokkumar Subramanian (subramaa), Hermes Agent
+diff --git a/plugins/context_engine/working-memory/state_extractor.py b/plugins/context_engine/working-memory/state_extractor.py
+new file mode 100644
+--- /dev/null
++++ b/plugins/context_engine/working-memory/state_extractor.py
+@@ -0,0 +1,1060 @@
++"""
++State extraction and working-memory management for WorkingMemoryCompressor.
++
++No Hermes core imports that would create circular dependencies.  Uses
++``agent.auxiliary_client.call_llm`` for one-shot structured LLM calls.
++
++Key design decisions:
++- LLM never writes Markdown files directly; it returns structured JSON patches.
++- Patches are validated and applied deterministically by Python code.
++- Secret filtering runs before any state is persisted.
++- Atomic writes with version history.
++- Significance gate avoids LLM calls on trivial turns.
++- Recursion guard prevents state-update calls from triggering another turn.
++"""
++
++from __future__ import annotations
++
++import copy
++import json
++import logging
++import os
++import re
++import time
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++# ── Secrets / redaction patterns ─────────────────────────────────────────
++# Must be kept in sync with actual credential formats.
++_REDACT_PATTERNS: List[Tuple[re.Pattern, str]] = [
++    # OpenAI / Anthropic / generic API keys
++    (re.compile(r'\b(sk-[A-Za-z0-9]{20,})\b'), 'sk-...REDACTED'),
++    (re.compile(r"""\b(api[-_]?key[-_]?['"]?\s*[:=]\s*['"]?[A-Za-z0-9_-]{20,})""", re.IGNORECASE), 'API_KEY_REDACTED'),
++    # Bearer tokens
++    (re.compile(r'\bBearer\s+[A-Za-z0-9\-._~+/]{20,}', re.IGNORECASE), 'Bearer REDACTED'),
++    # Authorization headers
++    (re.compile(r'\bAuthorization\s*:\s*Basic\s+[A-Za-z0-9+/=]{10,}', re.IGNORECASE), 'Authorization: Basic REDACTED'),
++    (re.compile(r'\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9\-._~+/]{10,}', re.IGNORECASE), 'Authorization: Bearer REDACTED'),
++    # JWT-like tokens (three base64url segments separated by dots)
++    (re.compile(r'\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b'), 'JWT_REDACTED'),
++    # Password/token/secret assignment patterns
++    (re.compile(r"""\b(password|secret|token|apikey|api_key)\s*[:=]\s*['"]?\S{8,}""", re.IGNORECASE), r'\1: REDACTED'),
++    # Known credential file paths (allow path reference but not content)
++    (re.compile(r'(atlassian-apikey\.json|oauth\.json|auth\.json|\.env)\s*["\']?\s*:\s*["\']?\S{10,}'), r'\1: REDACTED'),
++]
++
++# ── Significance gate heuristics ──────────────────────────────────────────
++# Patterns that indicate a "meaningful" turn worth extracting state from.
++_SIGNIFICANT_PATTERNS: List[re.Pattern] = [
++    re.compile(r'\b(patch|write|create|delete|rename|move|copy|edit|update)\b', re.IGNORECASE),
++    re.compile(r'\b(decided?|decision|choose|select|opt|prefer)\b', re.IGNORECASE),
++    re.compile(r'\b(blocker|blocked|stuck|bug|error|fail|issue|problem)\b', re.IGNORECASE),
++    re.compile(r'\b(fix|fixed|resolve|resolve|workaround|solved|solved)\b', re.IGNORECASE),
++    re.compile(r'\b(architect|design|refactor|restructur|migrate|convert)\b', re.IGNORECASE),
++    re.compile(r'\b(test|tested|verify|validated|confirmed|works|broken)\b', re.IGNORECASE),
++    re.compile(r'\b(goal|objective|task|todo|next|action|plan|step)\b', re.IGNORECASE),
++    re.compile(r'\b(config|deploy|install|setup|migrate|upgrade|downgrade)\b', re.IGNORECASE),
++    re.compile(r'\b(model|provider|api|endpoint|token|auth|credential)\b', re.IGNORECASE),
++    re.compile(r'\b(session|context|engine|compressor|memory|plugin)\b', re.IGNORECASE),
++    re.compile(r'\b(path|file|dir|folder|script|binary|executable)\b', re.IGNORECASE),
++]
++
++# Trivial responses that should never trigger state extraction
++_TRIVIAL_RESPONSE_PATTERNS: List[re.Pattern] = [
++    re.compile(r'^(hello|hi|hey|thanks|thank you|ty|ok|okay|k|sure|yes|no|bye|goodbye|good\s*morning|good\s*afternoon)', re.IGNORECASE),
++    re.compile(r'^(lol|lmao|rofl|nice|great|awesome|perfect|cool)', re.IGNORECASE),
++    re.compile(r'^[0-9+\-*/.=()\s]{1,10}$'),  # simple arithmetic
++]
++
++# ── State extraction prompt template ──────────────────────────────────────
++_STATE_EXTRACTION_PROMPT = """You are a structured state-extraction assistant. Your job is to analyze a conversation turn and produce a JSON patch describing what changed.
++
++Read the conversation turn below. Identify any meaningful state changes relevant to the user's ongoing project or session.
++
++Return ONLY valid JSON matching this schema (no markdown, no explanation):
++
++{{
++  "stable_add": ["long-lived fact 1", "long-lived fact 2"],
++  "stable_resolve": ["exact stable fact text to remove"],
++  "architecture_add": ["architecture decision 1"],
++  "paths_add": ["important file path 1"],
++  "constraints_add": ["explicit user constraint 1"],
++  "constraints_resolve": ["exact constraint text to remove"],
++  "confirmed_working_add": ["verified working 1"],
++  "confirmed_working_resolve": ["exact confirmed-working text to remove"],
++  "blockers_add": ["new blocker 1"],
++  "blockers_resolve": ["exact blocker text to remove"],
++  "decisions_add": ["decision made 1"],
++  "decisions_resolve": ["exact decision text to remove"],
++  "questions_add": ["new open question 1"],
++  "questions_resolve": ["exact question text to remove"],
++  "next_actions_add": ["new next action 1"],
++  "next_actions_remove": ["exact action text to remove"],
++  "recent_changes_add": ["meaningful change 1"],
++  "architecture_add": ["architecture decision 1"],
++  "architecture_resolve": ["exact arch ID"],
++  "paths_add": ["important file path 1"],
++  "paths_resolve": ["exact path ID"],
++  "constraints_add": ["explicit user constraint 1"],
++  "constraints_resolve": ["exact constraint ID"],
++  "confirmed_working_add": ["verified working 1"],
++  "confirmed_working_resolve": ["exact confirmed-working ID"],
++  "blockers_add": ["new blocker 1"],
++  "blockers_resolve": ["exact blocker ID"],
++  "decisions_add": ["decision made 1"],
++  "decisions_resolve": ["exact decision ID"],
++  "provisional_decisions_add": ["provisional decision 1"],
++  "provisional_decisions_resolve": ["exact provisional decision ID"],
++  "questions_add": ["new open question 1"],
++  "questions_resolve": ["exact question ID"],
++  "next_actions_add": ["new next action 1"],
++  "next_actions_remove": ["exact action ID"],
++  "recent_changes_add": ["meaningful change 1"],
++  "current_objective": "active objective for this session",
++  "significance": "high" or "low" or "none"
++}}
++
++CLASSIFICATION RULES:
++- "stable_add": truly permanent facts (project purpose, immutable architecture, owned paths, user's explicit durable rules). Almost nothing belongs here.
++- "constraints_add": explicit user-imposed rules (e.g. "Do not broadcast transactions automatically"). NOT technical limitations.
++- "blockers_add": temporary technical limitations that could be resolved (e.g. "Current API does not expose Task Type").
++- "decisions_add": long-lived decisions that are clearly settled and unlikely to change. These go to stable.md.
++- "provisional_decisions_add": tentative/provisional decisions made during debugging or exploration. These go to state.md and are NOT promoted to stable until confirmed.
++- "confirmed_working_add": features or functionality verified to work.
++- "current_objective": the single active goal the user is working toward right now. Omit if unclear.
++- All resolve fields: use the entry's ID (e.g. "dec-003") to remove it. Do NOT use the full text — IDs are shown in the reference material below.
++
++Rules:
++- "significance": "none" means no meaningful state changes detected. Skip all other fields.
++- "significance": "low" means minor changes (e.g. a single file path, a small clarification).
++- "significance": "high" means major changes (architecture decisions, blockers, new goals).
++- Each entry should be a concise actionable statement (1-2 sentences max).
++- If a decided item already exists, do NOT add it again.
++- Do NOT store: greetings, casual conversation, intermediate reasoning, huge outputs, secrets, passwords, API keys, tokens, credentials.
++- Do NOT duplicate existing state. These are additive patches.
++- Resolve by ID: to remove an existing item, give its ID (e.g. "dec-003"). The ID is shown in brackets at the start of each line in the reference material.
++- If nothing meaningful changed, return {{"significance": "none"}}.
++
++Current stable facts (read-only context for reference):
++---STABLE_START---
++{stable_text}
++---STABLE_END---
++
++Current state (read-only context for reference):
++---STATE_START---
++{state_text}
++---STATE_END---
++
++Conversation turn to analyze:
++---TURN_START---
++{turn_text}
++---TURN_END---
++"""
++
++MAX_TURN_CHARS = 8000  # Truncate turn text to keep prompt affordable
++
++# ── Bootstrap state extraction prompt ──────────────────────────────────────
++# Used for initial population of state.md from full session history.
++# Different from the incremental patch prompt: asks for full operational state.
++_BOOTSTRAP_PROMPT = """You are a structured state-extraction assistant. Your job is to analyze the ENTIRE conversation history of a session and produce a JSON patch describing the current operational state.
++
++Read the full conversation history below. Identify the current objective, confirmed working features, provisional decisions, active blockers, unresolved questions, next actions, and recent meaningful changes.
++
++Return ONLY valid JSON matching this schema (no markdown, no explanation):
++
++{{
++  "current_objective": "single active objective for this session",
++  "confirmed_working_add": ["verified working feature 1", "verified working feature 2"],
++  "provisional_decisions_add": ["provisional/tentative decision 1"],
++  "blockers_add": ["active blocker 1"],
++  "questions_add": ["unresolved question 1"],
++  "next_actions_add": ["next action 1"],
++  "recent_changes_add": ["meaningful change 1"]
++}}
++
++CLASSIFICATION RULES:
++- "current_objective": the single active goal. Omit if unclear.
++- "confirmed_working_add": features or functionality verified to work through testing.
++- "provisional_decisions_add": tentative or provisional decisions made during the session.
++- "blockers_add": current technical limitations or blockers.
++- "questions_add": currently unresolved questions.
++- "next_actions_add": clearly identified next steps.
++- "recent_changes_add": meaningful changes that occurred during this session.
++
++Rules:
++- Each entry should be a concise actionable statement (1-2 sentences max).
++- Do NOT store: greetings, casual conversation, intermediate reasoning, huge outputs, secrets, passwords, API keys, tokens, credentials.
++- Do NOT duplicate. These are additive patches.
++- If the session has no meaningful state, return {{"current_objective": ""}}.
++- Do NOT add entries that are already present in the existing state below.
++
++Existing state (read-only context for reference):
++---STATE_START---
++{state_text}
++---STATE_END---
++
++Full conversation history:
++---HISTORY_START---
++{history_text}
++---HISTORY_END---
++"""
++
++# Maximum history length for bootstrap (chars)
++_BOOTSTRAP_MAX_CHARS = 50000
++
++
++# ── Memory entry ID system ────────────────────────────────────────────────
++# Each markdown bullet is prefixed with a stable ID like [dec-001] so that
++# resolve operations reference the ID rather than depending on exact wording.
++# ID_COUNTERS_FILE stores the next available counter per prefix.
++ID_COUNTERS_FILE = "_ids.json"
++# Prefixes per section (used in markdown formatting and ID generation)
++ID_PREFIX: Dict[str, str] = {
++    "Working Memory": "stable",
++    "Architecture": "arch",
++    "Important Files and Paths": "path",
++    "Explicit User Constraints": "const",
++    "Confirmed Long-Lived Decisions": "dec",
++    "Current Objective": "obj",
++    "Confirmed Working": "cw",
++    "Active Blockers": "blk",
++    "Unresolved Questions": "q",
++    "Next Actions": "act",
++    "Provisional Decisions": "pdec",
++}
++# Regex to extract ID prefix from a markdown item: "[dec-001] content"
++_ID_RE = re.compile(r'^\[([a-z]+-\d+)\]\s*(.*)$')
++# Regex to match the ID part only: "dec-001"
++_ID_PART_RE = re.compile(r'^[a-z]+-\d+$')
++
++# ── Memory budget limits (Phase 3) ────────────────────────────────────────
++STABLE_MAX_TOKENS = 4000   # stable.md target budget
++STATE_MAX_TOKENS = 6000    # state.md target budget
++_BUDGET_WARNED: set = set()  # (session_id, file) pairs already warned
++
++
++# ── Public API ────────────────────────────────────────────────────────────
++
++def is_significant_turn(
++    messages: List[Dict[str, Any]],
++    *,
++    interrupted: bool = False,
++    failed: bool = False,
++) -> Tuple[bool, str]:
++    """Cheap deterministic significance gate.
++
++    Returns (is_significant, reason) tuple.  Skips interrupted/failed turns,
++    trivial responses, and turns with no meaningful content.
++    """
++    # Skip interrupted or failed turns
++    if interrupted:
++        return False, "turn_interrupted"
++    if failed:
++        return False, "turn_failed"
++
++    # Extract the last assistant response text (if any)
++    response_text = ""
++    user_text = ""
++    for msg in reversed(messages):
++        if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
++            response_text = msg["content"]
++            break
++    for msg in reversed(messages):
++        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
++            user_text = msg["content"]
++            break
++
++    # Check for trivial responses
++    for pat in _TRIVIAL_RESPONSE_PATTERNS:
++        if pat.search(response_text.strip()):
++            return False, "trivial_response"
++
++    # Check for tool_calls in assistant messages (always significant)
++    for msg in messages:
++        if msg.get("role") == "assistant" and msg.get("tool_calls"):
++            return True, "tool_calls_present"
++
++    # Check meaningful patterns in response + user message
++    combined = response_text + " " + user_text
++    for pat in _SIGNIFICANT_PATTERNS:
++        if pat.search(combined):
++            return True, f"pattern_match: {pat.pattern[:40]}"
++
++    return False, "no_significant_patterns"
++
++
++def extract_state_patch(
++    agent: Any,
++    messages: List[Dict[str, Any]],
++    stable_text: str,
++    state_text: str,
++    session_id: str,
++) -> Optional[Dict[str, Any]]:
++    """Call the LLM to extract a structured state patch.
++
++    Uses ``agent.auxiliary_client.call_llm`` which is Hermes's standard
++    auxiliary LLM mechanism (used by compression, vision, etc.).
++
++    Returns the parsed JSON patch dict, or None on failure.
++    """
++    # Build turn text
++    turn_text = _messages_to_text(messages)
++    if len(turn_text) > MAX_TURN_CHARS:
++        turn_text = turn_text[:MAX_TURN_CHARS] + "\n...[truncated]..."
++
++    prompt = _STATE_EXTRACTION_PROMPT.format(
++        stable_text=stable_text or "(none yet)",
++        state_text=state_text or "(none yet)",
++        turn_text=turn_text,
++    )
++
++    try:
++        from agent.auxiliary_client import call_llm
++
++        resp = call_llm(
++            messages=[{"role": "user", "content": prompt}],
++            task="working_memory",
++            max_tokens=2000,
++            temperature=0.1,
++            timeout=60,
++        )
++        body = (
++            resp.choices[0].message.content
++            if hasattr(resp, "choices") and resp.choices
++            else str(resp)
++        ) or ""
++    except Exception as exc:
++        logger.warning(
++            "State extraction LLM call failed (session=%s): %s",
++            session_id, exc,
++        )
++        return None
++
++    # Parse JSON from response (strip markdown fences if present)
++    patch = _parse_json_response(body)
++    if patch is None:
++        logger.debug("State extraction: failed to parse LLM response as JSON")
++        return None
++
++    # Validate structure
++    if not isinstance(patch, dict):
++        logger.debug("State extraction: response is not a dict")
++        return None
++
++    # Check significance
++    sig = patch.get("significance", "none")
++    if sig == "none":
++        return {"significance": "none", "_raw": patch}
++
++    # Normalize all list fields
++    for key in (
++        "stable_add", "stable_resolve", "architecture_add", "architecture_resolve",
++        "paths_add", "paths_resolve",
++        "constraints_add", "constraints_resolve",
++        "confirmed_working_add", "confirmed_working_resolve",
++        "blockers_add", "blockers_resolve",
++        "decisions_add", "decisions_resolve",
++        "provisional_decisions_add", "provisional_decisions_resolve",
++        "questions_add", "questions_resolve",
++        "next_actions_add", "next_actions_remove", "recent_changes_add",
++        "current_objective",
++    ):
++        val = patch.get(key, [])
++        if not isinstance(val, list):
++            patch[key] = []
++        else:
++            patch[key] = [_normalize_entry(str(v)) for v in val if isinstance(v, str)]
++
++    # Redact secrets from patch entries
++    for key in patch:
++        if isinstance(patch[key], list):
++            patch[key] = [_redact_secrets(v) for v in patch[key]]
++        elif isinstance(patch[key], str):
++            patch[key] = _redact_secrets(patch[key])
++
++    return patch
++
++
++
++
++def bootstrap_session_state(
++    session_id: str,
++    session_dir: Path,
++    messages: List[Dict[str, Any]],
++    stable_text: str = "",
++    state_text: str = "",
++) -> bool:
++    """Bootstrap operational state for a session from full conversation history.
++
++    This is a one-time population of state.md sections (Current Objective,
++    Confirmed Working, Provisional Decisions, Active Blockers, Questions,
++    Next Actions, Recent Changes).  It does NOT modify stable.md.
++
++    Uses the existing auxiliary LLM call and deterministic patch machinery.
++    Is idempotent: running it twice without new history will not duplicate state.
++
++    Args:
++        session_id: Hermes session ID (for logging).
++        session_dir: Path to the working-memory directory for this session.
++        messages: Full conversation history as OpenAI-format message dicts.
++        stable_text: Current stable.md content (read-only, not modified).
++        state_text: Current state.md content (will be updated).
++
++    Returns:
++        True if bootstrap produced new state, False otherwise.
++    """
++    # Build history text
++    history_text = _messages_to_text(messages)
++    if len(history_text) > _BOOTSTRAP_MAX_CHARS:
++        # Keep head and tail of the history
++        half = _BOOTSTRAP_MAX_CHARS // 2
++        history_text = (
++            history_text[:half]
++            + "\n\n...[middle of history truncated]...\n\n"
++            + history_text[-half:]
++        )
++
++    prompt = _BOOTSTRAP_PROMPT.format(
++        state_text=state_text or "(empty)",
++        history_text=history_text,
++    )
++
++    try:
++        from agent.auxiliary_client import call_llm
++
++        resp = call_llm(
++            messages=[{"role": "user", "content": prompt}],
++            task="working_memory_bootstrap",
++            max_tokens=2000,
++            temperature=0.1,
++            timeout=120,
++        )
++        body = (
++            resp.choices[0].message.content
++            if hasattr(resp, "choices") and resp.choices
++            else str(resp)
++        ) or ""
++    except Exception as exc:
++        logger.warning(
++            "Bootstrap LLM call failed (session=%s): %s",
++            session_id, exc,
++        )
++        return False
++
++    # Parse JSON
++    patch = _parse_json_response(body)
++    if patch is None:
++        logger.debug("Bootstrap: failed to parse LLM response as JSON")
++        return False
++
++    if not isinstance(patch, dict):
++        logger.debug("Bootstrap: response is not a dict")
++        return False
++
++    # Check if bootstrap produced anything
++    obj = patch.get("current_objective", "")
++    has_content = bool(obj and obj.strip())
++    for key in ("confirmed_working_add", "provisional_decisions_add",
++                "blockers_add", "questions_add", "next_actions_add",
++                "recent_changes_add"):
++        vals = patch.get(key, [])
++        if isinstance(vals, list) and vals:
++            has_content = True
++
++    if not has_content:
++        logger.info("Bootstrap: no meaningful state found for session %s", session_id)
++        return False
++
++    # Force current_objective into the patch
++    if obj and isinstance(obj, str):
++        patch["current_objective"] = obj.strip()
++    else:
++        patch["current_objective"] = ""
++
++    # Normalize and redact (same as extract_state_patch)
++    for key in (
++        "confirmed_working_add", "provisional_decisions_add",
++        "blockers_add", "questions_add", "next_actions_add",
++        "recent_changes_add",
++    ):
++        val = patch.get(key, [])
++        if not isinstance(val, list):
++            patch[key] = []
++        else:
++            patch[key] = [_normalize_entry(str(v)) for v in val if isinstance(v, str)]
++
++    for key in patch:
++        if isinstance(patch[key], list):
++            patch[key] = [_redact_secrets(v) for v in patch[key]]
++        elif isinstance(patch[key], str):
++            patch[key] = _redact_secrets(patch[key])
++
++    # Load ID counters
++    id_counters = load_id_counters(session_dir)
++    prior_counters = dict(id_counters)  # snapshot for rollback
++
++    # Apply patch to state.md only (stable.md is NOT modified)
++    # The patch routes through apply_state_patch which naturally avoids
++    # stable.md changes because we don't set any stable_add/decisions_add keys.
++    # We explicitly set decisions_add=[] to prevent cross-file promotion.
++    patch["decisions_add"] = []
++    patch["stable_add"] = []
++    patch["architecture_add"] = []
++    patch["paths_add"] = []
++    patch["constraints_add"] = []
++
++    new_stable, new_state = apply_state_patch(
++        patch, stable_text, state_text,
++        id_counters=id_counters,
++        session_dir=session_dir,
++    )
++
++    # Check if state actually changed
++    if new_state == state_text:
++        logger.info("Bootstrap: no changes needed (session=%s)", session_id)
++        return False
++
++    # Write files atomically
++    ok = write_state_files(
++        session_dir, new_stable, new_state,
++        max_versions=10, session_id=session_id,
++    )
++    if ok:
++        logger.info(
++            "Bootstrap: state populated for session %s (objective=%s, entries=%d)",
++            session_id, patch.get("current_objective", "")[:60],
++            sum(len(v) for v in patch.values() if isinstance(v, list)),
++        )
++        return True
++    else:
++        logger.warning("Bootstrap: file write failed (session=%s)", session_id)
++        # Rollback ID counters
++        save_id_counters(session_dir, prior_counters)
++        return False
++
++def apply_state_patch(
++    patch: Dict[str, Any],
++    stable_text: str,
++    state_text: str,
++    *,
++    id_counters: Optional[Dict[str, int]] = None,
++    session_dir: Optional[Path] = None,
++) -> Tuple[str, str]:
++    """Apply a validated patch to stable and state text.
++
++    Returns (new_stable, new_state) as Markdown strings.
++    Never modifies input strings in place.
++    """
++    # Parse existing state
++    stable_sections = _parse_markdown_sections(stable_text)
++    state_sections = _parse_markdown_sections(state_text)
++
++    # ── Stable sections (with resolve support) ──
++    if "Working Memory" not in stable_sections:
++        stable_sections["Working Memory"] = []
++    stable_sections["Working Memory"] = _apply_add_remove(
++        stable_sections["Working Memory"],
++        patch.get("stable_add", []),
++        patch.get("stable_resolve", []),
++        id_counters=id_counters,
++        section_name="Working Memory",
++    )
++    # Sub-sections of stable (with resolve support for all sections)
++    for section_key, add_key, remove_key in [
++        ("Architecture", "architecture_add", "architecture_resolve"),
++        ("Important Files and Paths", "paths_add", "paths_resolve"),
++        ("Explicit User Constraints", "constraints_add", "constraints_resolve"),
++        ("Confirmed Long-Lived Decisions", "decisions_add", "decisions_resolve"),
++    ]:
++        if section_key not in stable_sections:
++            stable_sections[section_key] = []
++        stable_sections[section_key] = _apply_add_remove(
++            stable_sections[section_key],
++            patch.get(add_key, []),
++            patch.get(remove_key, []) if remove_key else [],
++            id_counters=id_counters,
++            section_name=section_key,
++        )
++
++    # ── State sections (OWNERSHIP: decisions go to stable.md only) ──
++    # decisions_add is ONLY routed to stable.md "Confirmed Long-Lived Decisions"
++    # to prevent cross-file duplication. State.md has no "Decisions Made" section.
++    for section_key, add_key, remove_key in [
++        ("Confirmed Working", "confirmed_working_add", "confirmed_working_resolve"),
++        ("Provisional Decisions", "provisional_decisions_add", "provisional_decisions_resolve"),
++        ("Active Blockers", "blockers_add", "blockers_resolve"),
++        ("Unresolved Questions", "questions_add", "questions_resolve"),
++        ("Next Actions", "next_actions_add", "next_actions_remove"),
++    ]:
++        if section_key not in state_sections:
++            state_sections[section_key] = []
++        state_sections[section_key] = _apply_add_remove(
++            state_sections[section_key],
++            patch.get(add_key, []),
++            patch.get(remove_key, []),
++            id_counters=id_counters,
++            section_name=section_key,
++        )
++
++    # Current Objective: single string, not a list
++    if "current_objective" in patch and isinstance(patch["current_objective"], str):
++        obj = patch["current_objective"].strip()
++        if obj:
++            state_sections["Current Objective"] = [obj]
++
++    # Recent changes: append-only, capped at 20
++    if "Recent Meaningful Changes" not in state_sections:
++        state_sections["Recent Meaningful Changes"] = []
++    changes = state_sections["Recent Meaningful Changes"]
++    changes.extend(patch.get("recent_changes_add", []))
++    # Deduplicate
++    seen = set()
++    unique_changes = []
++    for c in reversed(changes):
++        key = c.strip().lower()
++        if key not in seen:
++            seen.add(key)
++            unique_changes.append(c)
++    state_sections["Recent Meaningful Changes"] = list(reversed(unique_changes))[:20]
++
++    # ── Rebuild Markdown ──
++    new_stable = _rebuild_stable_markdown(stable_sections)
++    new_state = _rebuild_state_markdown(state_sections)
++
++    return new_stable, new_state
++
++
++def write_state_files(
++    session_dir: Path,
++    stable_text: str,
++    state_text: str,
++    *,
++    timestamp: Optional[str] = None,
++    max_versions: int = 10,
++    session_id: str = "",
++) -> bool:
++    """Atomically write state files with version history.
++
++    Saves previous versions under ``versions/`` subdirectory.
++    Returns True on success, False on failure.
++    """
++    if timestamp is None:
++        timestamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
++
++    try:
++        versions_dir = session_dir / "versions"
++        versions_dir.mkdir(parents=True, exist_ok=True)
++
++        # Save previous versions before overwriting
++        for fname in (STABLE_FILE := "stable.md", STATE_FILE := "state.md"):
++            src = session_dir / fname
++            if src.exists():
++                import shutil
++                dst = versions_dir / f"{fname.replace('.md', '')}-{timestamp}.md"
++                shutil.copy2(src, dst)
++
++        # Atomic writes: write to temp, rename into place
++        _atomic_write(session_dir / STABLE_FILE, stable_text)
++        _atomic_write(session_dir / STATE_FILE, state_text)
++
++        # Clean up old versions
++        _cleanup_old_versions(versions_dir, max_versions)
++
++        # Persist ID counters
++        _counters = load_id_counters(session_dir)
++        if _counters:
++            save_id_counters(session_dir, _counters)
++
++        # Budget check (shadow mode: log only, no truncation)
++        from agent.model_metadata import estimate_tokens_rough
++        stable_tok = estimate_tokens_rough(stable_text)
++        state_tok = estimate_tokens_rough(state_text)
++        _key = f"{session_id}"
++        if stable_tok > STABLE_MAX_TOKENS and _key + ":stable" not in _BUDGET_WARNED:
++            logger.warning("stable.md ~%d tokens exceeds %d budget (session=%s)", stable_tok, STABLE_MAX_TOKENS, session_id)
++            _BUDGET_WARNED.add(_key + ":stable")
++        if state_tok > STATE_MAX_TOKENS and _key + ":state" not in _BUDGET_WARNED:
++            logger.warning("state.md ~%d tokens exceeds %d budget (session=%s)", state_tok, STATE_MAX_TOKENS, session_id)
++            _BUDGET_WARNED.add(_key + ":state")
++        return True
++    except OSError as exc:
++        logger.warning("Failed to write state files: %s", exc)
++        return False
++
++
++def load_state_files(session_dir: Path) -> Tuple[str, str]:
++    """Load current stable and state text. Returns empty strings on failure."""
++    stable = ""
++    state = ""
++    try:
++        sp = session_dir / "stable.md"
++        if sp.exists():
++            stable = sp.read_text(encoding="utf-8", errors="replace")
++    except OSError:
++        pass
++    try:
++        sp = session_dir / "state.md"
++        if sp.exists():
++            state = sp.read_text(encoding="utf-8", errors="replace")
++    except OSError:
++        pass
++    # Run migration on existing entries (idempotent)
++    try:
++        migrate_existing_entries(session_dir)
++        # Reload after migration
++        try:
++            sp = session_dir / "stable.md"
++            if sp.exists():
++                stable = sp.read_text(encoding="utf-8", errors="replace")
++        except OSError:
++            pass
++        try:
++            sp = session_dir / "state.md"
++            if sp.exists():
++                state = sp.read_text(encoding="utf-8", errors="replace")
++        except OSError:
++            pass
++    except Exception as exc:
++        logger.debug("Migration failed: %s", exc)
++    return stable, state
++
++
++# ── Internal helpers ──────────────────────────────────────────────────────
++
++_RECURSION_GUARD_ATTR = "_wm_updating_state"
++
++
++def set_updating_flag(agent: Any) -> bool:
++    """Atomically check and set the recursion guard flag.
++
++    Returns True if the flag was already set (re-entrant call detected).
++    Returns False if we acquired the flag (safe to proceed).
++    """
++    if getattr(agent, _RECURSION_GUARD_ATTR, False):
++        return True  # Already in a state update
++    setattr(agent, _RECURSION_GUARD_ATTR, True)
++    return False
++
++
++def clear_updating_flag(agent: Any) -> None:
++    """Clear the recursion guard flag."""
++    setattr(agent, _RECURSION_GUARD_ATTR, False)
++
++
++def _messages_to_text(messages: List[Dict[str, Any]]) -> str:
++    """Convert messages to a flat text representation for the LLM."""
++    parts = []
++    for msg in messages:
++        role = msg.get("role", "?")
++        content = msg.get("content", "")
++        if isinstance(content, list):
++            text_parts = []
++            for part in content:
++                if isinstance(part, dict) and part.get("type") == "text":
++                    text_parts.append(part.get("text", ""))
++            content = " ".join(text_parts)
++        if not isinstance(content, str):
++            content = str(content)
++        # Truncate very long tool results
++        if len(content) > 2000:
++            content = content[:2000] + f"\n...[+{len(content)-2000} chars truncated]..."
++        # Include tool call info
++        tool_calls = msg.get("tool_calls")
++        if tool_calls:
++            content += "\n[TOOL_CALLS: " + str(len(tool_calls)) + "]"
++        parts.append(f"[{role}]: {content}")
++    return "\n\n".join(parts)
++
++
++def _parse_json_response(text: str) -> Optional[Dict[str, Any]]:
++    """Parse JSON from LLM response, stripping markdown fences if needed."""
++    text = text.strip()
++    # Remove markdown code fences
++    if text.startswith("```"):
++        # Find the first newline after ```
++        first_nl = text.find("\n")
++        if first_nl != -1:
++            text = text[first_nl:].strip()
++        # Remove trailing ```
++        if text.endswith("```"):
++            text = text[:-3].strip()
++        elif text.endswith("```\n"):
++            text = text[:-4].strip()
++    try:
++        return json.loads(text)
++    except json.JSONDecodeError:
++        # Try to find JSON in the text
++        brace_start = text.find("{")
++        brace_end = text.rfind("}")
++        if brace_start != -1 and brace_end > brace_start:
++            try:
++                return json.loads(text[brace_start:brace_end + 1])
++            except json.JSONDecodeError:
++                pass
++        return None
++
++
++def _normalize_entry(text: str) -> str:
++    """Normalize whitespace and case for deterministic dedup."""
++    text = re.sub(r'\s+', ' ', text).strip()
++    return text
++
++
++
++def _redact_secrets(text: str) -> str:
++    """Redact likely secrets from text."""
++    result = text
++    for pattern, replacement in _REDACT_PATTERNS:
++        result = pattern.sub(replacement, result)
++    return result
++
++def _strip_id(item: str) -> Tuple[Optional[str], str]:
++    """Extract the ID prefix from a markdown list item.
++
++    Returns (id, text_without_id).  If no ID prefix is found,
++    returns (None, item).
++    """
++    m = _ID_RE.match(item)
++    if m:
++        return m.group(1), m.group(2).strip()
++    return None, item
++
++
++def _get_next_id_counter(counters: Dict[str, int], prefix: str) -> int:
++    """Return the next available counter for a prefix, starting at 1."""
++    return counters.get(prefix, 0) + 1
++
++
++def _set_next_id_counter(counters: Dict[str, int], prefix: str, value: int) -> None:
++    """Set the next counter value for a prefix."""
++    counters[prefix] = value
++
++
++def load_id_counters(session_dir: Path) -> Dict[str, int]:
++    """Load the ID counter state from the session directory."""
++    try:
++        p = session_dir / ID_COUNTERS_FILE
++        if p.exists():
++            with p.open() as f:
++                return json.load(f)
++    except (OSError, json.JSONDecodeError):
++        pass
++    return {}
++
++
++def save_id_counters(session_dir: Path, counters: Dict[str, int]) -> None:
++    """Atomically save the ID counter state."""
++    try:
++        _atomic_write(session_dir / ID_COUNTERS_FILE, json.dumps(counters, indent=2))
++    except OSError as exc:
++        logger.debug("Failed to save ID counters: %s", exc)
++
++
++def migrate_existing_entries(session_dir: Path) -> None:
++    """Migrate existing state files to add ID prefixes to entries.
++
++    Reads stable.md and state.md, assigns IDs to any entries that lack them,
++    and writes the result back atomically.  Safe to call multiple times
++    (idempotent — entries already with IDs are skipped).
++    """
++    counters = load_id_counters(session_dir)
++    changed = False
++
++    for fname in ("stable.md", "state.md"):
++        fpath = session_dir / fname
++        if not fpath.exists():
++            continue
++        text = fpath.read_text(encoding="utf-8", errors="replace")
++        sections = _parse_markdown_sections(text)
++        for section_name, items in sections.items():
++            if section_name.startswith("_"):
++                continue
++            prefix = ID_PREFIX.get(section_name, "")
++            if not prefix:
++                continue
++            new_items = []
++            for item in items:
++                item_id, item_text = _strip_id(item)
++                if item_id:
++                    new_items.append(item)
++                else:
++                    n = _get_next_id_counter(counters, prefix)
++                    _set_next_id_counter(counters, prefix, n + 1)
++                    new_items.append(f"[{prefix}-{n:03d}] {item_text}")
++                    changed = True
++            sections[section_name] = new_items
++
++        if not changed:
++            continue
++        if fname == "stable.md":
++            new_text = _rebuild_stable_markdown(sections)
++        else:
++            new_text = _rebuild_state_markdown(sections)
++        _atomic_write(fpath, new_text)
++
++    if changed:
++        save_id_counters(session_dir, counters)
++        logger.info("Migrated existing entries: assigned IDs in %s", session_dir)
++
++
++def _parse_markdown_sections(md_text: str) -> Dict[str, List[str]]:
++    """Parse markdown into a dict of section -> list of bullet items.
++
++    Each item is stored as its raw markdown text (including ID prefix if present).
++    The ID prefix is extracted by ``_strip_id()`` at compare time.
++    """
++    sections: Dict[str, List[str]] = {}
++    current_section = "_header"
++    sections[current_section] = []
++
++    for line in md_text.split("\n"):
++        if line.startswith("#"):
++            heading = line.lstrip("#").strip()
++            current_section = heading
++            if current_section not in sections:
++                sections[current_section] = []
++        elif line.strip().startswith("- ") or line.strip().startswith("* "):
++            item = line.strip()[2:].strip()
++            if item:
++                sections.setdefault(current_section, []).append(item)
++        elif line.strip().startswith("1.") or line.strip().startswith("2."):
++            item = re.sub(r'^\d+\.\s*', '', line.strip()).strip()
++            if item:
++                sections.setdefault(current_section, []).append(item)
++
++    return sections
++
++
++def _apply_add_remove(
++    existing: List[str],
++    adds: List[str],
++    removes: List[str],
++    *,
++    id_counters: Optional[Dict[str, int]] = None,
++    section_name: str = "",
++) -> List[str]:
++    """Apply additive and removal patches to a list of items.
++
++    Resolution uses ID matching (primary) or normalized text (fallback).
++    New items get an auto-assigned ID prefix like ``[dec-003]``.
++    Assigns IDs using ``id_counters`` (mutated in place).  When
++    ``id_counters`` is None, IDs are not added (backward-compat path).
++    """
++    # Build a lookup: ID -> raw item, normalized -> raw item
++    id_map: Dict[str, str] = {}   # "dec-003" -> "[dec-003] content"
++    norm_map: Dict[str, str] = {} # "content" -> "[dec-003] content"
++
++    for item in existing:
++        item_id, item_text = _strip_id(item)
++        if item_id:
++            id_map[item_id] = item
++        norm_map[_normalize_entry(item_text or item)] = item
++
++    # ── Resolve: try ID first, then normalized text ───────────────
++    for remove in removes:
++        remove = remove.strip()
++        # Check if remove is an ID reference
++        if _ID_PART_RE.match(remove):
++            removed = id_map.pop(remove, None)
++            if removed is not None:
++                norm_key = _normalize_entry(_strip_id(removed)[1] or removed)
++                norm_map.pop(norm_key, None)
++                continue
++        # Fallback: normalized text match
++        norm_remove = _normalize_entry(remove)
++        removed_item = norm_map.pop(norm_remove, None)
++        if removed_item is not None:
++            r_id = _strip_id(removed_item)[0]
++            if r_id:
++                id_map.pop(r_id, None)
++
++    # ── Add new items ─────────────────────────────────────────────
++    prefix = ID_PREFIX.get(section_name, "")
++    next_counter = _get_next_id_counter(id_counters, prefix) if id_counters and prefix else 0
++
++    for add in adds:
++        add = add.strip()
++        if not add:
++            continue
++        norm_add = _normalize_entry(add)
++        # Skip if already exists (by normalized text)
++        if norm_add in norm_map:
++            continue
++        # Assign ID
++        if prefix and id_counters is not None:
++            n = _get_next_id_counter(id_counters, prefix)
++            _set_next_id_counter(id_counters, prefix, n + 1)
++            item = f"[{prefix}-{n:03d}] {add}"
++        else:
++            item = add
++        norm_map[norm_add] = item
++        entry_id = _strip_id(item)[0]
++        if entry_id:
++            id_map[entry_id] = item
++
++    return list(norm_map.values())
++
++
++def _rebuild_stable_markdown(sections: Dict[str, List[str]]) -> str:
++    """Rebuild stable.md from section dict."""
++    lines = ["# Stable Working Memory\n"]
++    section_order = [
++        "Working Memory",
++        "Architecture",
++        "Important Files and Paths",
++        "Explicit User Constraints",
++        "Confirmed Long-Lived Decisions",
++    ]
++    for sec in section_order:
++        items = sections.get(sec, [])
++        if items:
++            label = sec.replace("-", " / ").replace("_", " ")
++            lines.append(f"\n## {label}\n")
++            for item in items:
++                lines.append(f"- {item}\n")
++    return "".join(lines)
++
++
++def _rebuild_state_markdown(sections: Dict[str, List[str]]) -> str:
++    """Rebuild state.md from section dict."""
++    lines = ["# Current Working State\n"]
++    section_order = [
++        "Current Objective",
++        "Confirmed Working",
++        "Provisional Decisions",
++        "Active Blockers",
++        "Unresolved Questions",
++        "Next Actions",
++        "Recent Meaningful Changes",
++    ]
++    # Start with Current Objective if present
++    for sec in section_order:
++        items = sections.get(sec, [])
++        if sec == "Current Objective" and not items:
++            continue
++        label = sec.replace("-", " / ").replace("_", " ")
++        lines.append(f"\n## {label}\n")
++        for item in items:
++            lines.append(f"- {item}\n")
++    return "".join(lines)
++
++
++def _atomic_write(path: Path, content: str) -> None:
++    """Write content atomically to a file."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    tmp.write_text(content, encoding="utf-8")
++    tmp.replace(path)
++
++
++def _cleanup_old_versions(versions_dir: Path, max_versions: int) -> None:
++    """Remove oldest version files beyond the cap."""
++    try:
++        files = sorted(versions_dir.iterdir(), key=lambda p: p.stat().st_mtime)
++        while len(files) > max_versions:
++            oldest = files.pop(0)
++            oldest.unlink(missing_ok=True)
++    except OSError:
++        pass
+
